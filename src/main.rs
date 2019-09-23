@@ -1,9 +1,10 @@
+#![allow(non_camel_case_types)]
+
 use std::env;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 extern crate libc;
-use libc::size_t;
 
 #[derive(Debug)]
 struct Params {
@@ -14,15 +15,46 @@ struct Params {
     bitrate: u16,
 }
 
-#[link(name = "libmfx_vs2015")]
+pub type mfxU16 = u16;
+pub type mfxI32 = i32;
+pub type mfxIMPL = mfxI32;
+pub type mfxStatus = mfxI32;
+pub type mfxSession = libc::c_void;
+
+pub const MFX_IMPL_AUTO: mfxIMPL = 0x0000;
+pub const MFX_IMPL_SOFTWARE: mfxIMPL = 0x0001;
+pub const MFX_IMPL_HARDWARE: mfxIMPL = 0x0002;
+pub const MFX_IMPL_AUTO_ANY: mfxIMPL = 0x0003;
+
+pub const MFX_ERR_NONE: mfxStatus = 0;
+pub const MFX_ERR_UNKNOWN: mfxStatus = -1;
+pub const MFX_ERR_NULL_PTR: mfxStatus = -2;
+pub const MFX_ERR_UNSUPPORTED: mfxStatus = -3;
+
+#[repr(C)]
+pub struct mfxVersion {
+    pub minor: mfxU16,
+    pub major: mfxU16,
+}
+
+#[link(name = "libmfx_vs2015", kind = "static")]
 extern "C" {
-    fn MFXVideoENCODE_Close(source_length: size_t) -> size_t;
+    pub fn MFXInit(
+        implementation: mfxIMPL,
+        ver: *const mfxVersion,
+        session: *mut *mut mfxSession,
+    ) -> mfxStatus;
 }
 
 fn main() -> io::Result<()> {
-    let result = unsafe {
-        MFXVideoENCODE_Close(10);
+    let implementation = MFX_IMPL_AUTO_ANY;
+    let version: mfxVersion = mfxVersion { minor: 0, major: 1 };
+    let mut session: *mut mfxSession = std::ptr::null_mut();
+    match unsafe { MFXInit(implementation, &version, &mut session) } {
+        MFX_ERR_NONE => println!("MFX initialized"),
+        _ => println!("Error in MFX initialization"),
     };
+
     let args: Vec<String> = env::args().collect();
     if args.len() != 6 {
         println!("Usage: {} input output width height bitrate", args[0]);
