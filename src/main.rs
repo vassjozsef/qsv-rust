@@ -6,6 +6,8 @@ use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 extern crate libc;
+use std::mem;
+use std::ptr;
 
 #[derive(Debug)]
 struct Params {
@@ -144,7 +146,7 @@ pub struct mfxFrameInfo {
     pub FrameId: mfxFrameId,
     pub FourCC: mfxU32,
 
-    // Frame Paramaters, omit Buffer parameters
+    // TODO: union, frame paramaters, omit buffer parameters, both 96 bits
     pub Width: mfxU16,
     pub Height: mfxU16,
     pub CropX: mfxU16,
@@ -304,17 +306,46 @@ impl mfxExtBuffer {
 }
 
 #[repr(C)]
+pub struct mfxInfoVPP {
+    pub reserved: [mfxU32; 8],
+    In: mfxFrameInfo,
+    Out: mfxFrameInfo,
+}
+
+impl mfxInfoVPP {
+    pub fn new() -> Self {
+        mfxInfoVPP {
+            reserved: [0; 8],
+            In: mfxFrameInfo::new(),
+            Out: mfxFrameInfo::new(),
+        }
+    }
+}
+
+#[repr(C)]
+pub union mfxVideoParamUnion {
+    pub mfx: mfxInfoMFX,
+    pub vpp: mfxInfoVPP,
+}
+
+impl mfxVideoParamUnion {
+    pub fn new() -> Self {
+        mfxVideoParamUnion {
+            mfx: mfxInfoMFX::new(),
+        }
+    }
+}
+
+#[repr(C)]
 pub struct mfxVideoParam {
     pub AllocId: mfxU32,
     pub reserved: [mfxU32; 2],
     pub reserved3: mfxU16,
     pub AsyncDepth: mfxU16,
-    // TODO: omit vpp
-    pub mfx: mfxInfoMFX,
+    pub u: mfxVideoParamUnion,
     pub Protected: mfxU16,
     pub IOPattern: mfxU16,
-    // TODO: Fix *const *const
-    pub ExtParam: *const mfxExtBuffer,
+    pub ExtParam: *const *const mfxExtBuffer,
     pub NumExtParam: mfxU16,
     pub reserved2: mfxU16,
 }
@@ -326,10 +357,10 @@ impl mfxVideoParam {
             reserved: [0; 2],
             reserved3: 0,
             AsyncDepth: 0,
-            mfx: mfxInfoMFX::new(),
+            u: mfxVideoParamUnion::new(),
             Protected: 0,
             IOPattern: 0,
-            ExtParam: &mfxExtBuffer::new(),
+            ExtParam: ptr::null(),
             NumExtParam: 0,
             reserved2: 0,
         }
@@ -359,6 +390,13 @@ impl mfxFrameAllocRequest {
             reserved2: 0,
         }
     }
+}
+
+#[repr(C)]
+pub struct mfxFrameSurface1 {
+    pub reserved: [mfxU32; 4],
+    pub Info: mfxFrameInfo,
+    //    pub Data: mfxFrameData,
 }
 
 #[link(name = "libmfx_vs2015", kind = "static")]
@@ -393,6 +431,11 @@ fn align32(x: u32) -> u32 {
 }
 
 fn main() -> io::Result<()> {
+    println!("Size of mfxFrameInfo: {}", mem::size_of::<mfxFrameInfo>());
+    println!("Size of mfxInfoMFX: {}", mem::size_of::<mfxInfoMFX>());
+    println!("Size of mfxInfoVPP: {}", mem::size_of::<mfxInfoVPP>());
+    println!("Size of mfxVideoParam: {}", mem::size_of::<mfxVideoParam>());
+
     let implementation = MFX_IMPL_AUTO_ANY;
     let version = mfxVersion::new(1, 0);
     let mut session: *mut mfxSession = std::ptr::null_mut();
@@ -420,21 +463,23 @@ fn main() -> io::Result<()> {
     println!("{:?}", params);
 
     let mut mfxEncParams = mfxVideoParam::new();
-    mfxEncParams.mfx.CodecId = MFX_CODEC_AVC;
-    mfxEncParams.mfx.TargetUsage = MFX_TARGETUSAGE_BALANCED;
-    mfxEncParams.mfx.u2.TargetKbps = params.bitrate;
-    mfxEncParams.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
-    mfxEncParams.mfx.FrameInfo.FrameRateExtN = 30;
-    mfxEncParams.mfx.FrameInfo.FrameRateExtD = 1;
-    mfxEncParams.mfx.FrameInfo.FourCC = MFX_FOURCC_NV12;
-    mfxEncParams.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
-    mfxEncParams.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
-    mfxEncParams.mfx.FrameInfo.CropX = 0;
-    mfxEncParams.mfx.FrameInfo.CropY = 0;
-    mfxEncParams.mfx.FrameInfo.CropW = params.width as u16;
-    mfxEncParams.mfx.FrameInfo.CropH = params.height as u16;
-    mfxEncParams.mfx.FrameInfo.Width = align16(params.width as u16);
-    mfxEncParams.mfx.FrameInfo.Height = align16(params.height as u16);
+    unsafe {
+        mfxEncParams.u.mfx.CodecId = MFX_CODEC_AVC;
+        mfxEncParams.u.mfx.TargetUsage = MFX_TARGETUSAGE_BALANCED;
+        mfxEncParams.u.mfx.u2.TargetKbps = params.bitrate;
+        mfxEncParams.u.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+        mfxEncParams.u.mfx.FrameInfo.FrameRateExtN = 30;
+        mfxEncParams.u.mfx.FrameInfo.FrameRateExtD = 1;
+        mfxEncParams.u.mfx.FrameInfo.FourCC = MFX_FOURCC_NV12;
+        mfxEncParams.u.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        mfxEncParams.u.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
+        mfxEncParams.u.mfx.FrameInfo.CropX = 0;
+        mfxEncParams.u.mfx.FrameInfo.CropY = 0;
+        mfxEncParams.u.mfx.FrameInfo.CropW = params.width as u16;
+        mfxEncParams.u.mfx.FrameInfo.CropH = params.height as u16;
+        mfxEncParams.u.mfx.FrameInfo.Width = align16(params.width as u16);
+        mfxEncParams.u.mfx.FrameInfo.Height = align16(params.height as u16);
+    }
     mfxEncParams.IOPattern = MFX_IOPATTERN_IN_SYSTEM_MEMORY;
 
     let queryParams = unsafe { MFXVideoENCODE_Query(session, &mfxEncParams, &mut mfxEncParams) };
