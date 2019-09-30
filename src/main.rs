@@ -18,12 +18,16 @@ struct Params {
     bitrate: u16,
 }
 
+pub type mfxU8 = u8;
 pub type mfxU16 = u16;
 pub type mfxU32 = u32;
 pub type mfxI32 = i32;
+pub type mfxU64 = u64;
 pub type mfxIMPL = mfxI32;
 pub type mfxStatus = mfxI32;
 pub type mfxSession = libc::c_void;
+pub type mfxHDL = *const libc::c_void;
+pub type mfxMemId = mfxHDL;
 
 pub const MFX_IMPL_AUTO: mfxIMPL = 0x0000;
 pub const MFX_IMPL_SOFTWARE: mfxIMPL = 0x0001;
@@ -393,10 +397,69 @@ impl mfxFrameAllocRequest {
 }
 
 #[repr(C)]
+pub struct mfxFrameData {
+    // TODO: union ExtParam: const* const* mfxExtBuffer
+    pub reserved2: mfxU64,
+    NumExtParam: mfxU16,
+    reserved: [mfxU16; 9],
+    MemType: mfxU16,
+    PitchHigh: mfxU16,
+    TimeStamp: mfxU64,
+    FrameOrder: mfxU32,
+    Locked: mfxU16,
+    // TODO: union Pitch
+    PitchLow: mfxU16,
+
+    Y: *const mfxU8,
+    // union
+    U: *const mfxU8,
+    // union
+    V: *const mfxU8,
+    A: *const mfxU8,
+    MemId: mfxMemId,
+    Corrupted: mfxU16,
+    DataFlag: mfxU16,
+}
+
+impl mfxFrameData {
+    pub fn new() -> Self {
+        mfxFrameData {
+            reserved2: 0,
+            NumExtParam: 0,
+            reserved: [0; 9],
+            MemType: 0,
+            PitchHigh: 0,
+            TimeStamp: 0,
+            FrameOrder: 0,
+            Locked: 0,
+            PitchLow: 0,
+
+            Y: ptr::null(),
+            U: ptr::null(),
+            V: ptr::null(),
+            A: ptr::null(),
+            MemId: ptr::null(),
+            Corrupted: 0,
+            DataFlag: 0,
+        }
+    }
+}
+
+#[repr(C)]
 pub struct mfxFrameSurface1 {
     pub reserved: [mfxU32; 4],
     pub Info: mfxFrameInfo,
-    //    pub Data: mfxFrameData,
+    pub Data: mfxFrameData,
+}
+
+impl mfxFrameSurface1 {
+    pub fn new() -> Self {
+        mfxFrameSurface1 {
+            reserved: [0; 4],
+            Info: mfxFrameInfo::new(),
+            Data: mfxFrameData::new(),
+        }
+    }
 }
 
 #[link(name = "libmfx_vs2015", kind = "static")]
@@ -438,7 +501,7 @@ fn main() -> io::Result<()> {
 
     let implementation = MFX_IMPL_AUTO_ANY;
     let version = mfxVersion::new(1, 0);
-    let mut session: *mut mfxSession = std::ptr::null_mut();
+    let mut session: *mut mfxSession = ptr::null_mut();
     match unsafe { MFXInit(implementation, &version, &mut session) } {
         MFX_ERR_NONE => println!("MFX initialized"),
         _ => println!("Error in MFX initialization"),
