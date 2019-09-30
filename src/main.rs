@@ -23,6 +23,7 @@ pub type mfxU16 = u16;
 pub type mfxU32 = u32;
 pub type mfxI32 = i32;
 pub type mfxU64 = u64;
+pub type mfxI64 = i64;
 pub type mfxIMPL = mfxI32;
 pub type mfxStatus = mfxI32;
 pub type mfxSession = libc::c_void;
@@ -83,6 +84,7 @@ impl mfxVersion {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct mfxFrameIdStruct1 {
     pub DependencyId: mfxU16,
     pub QualityId: mfxU16,
@@ -98,6 +100,7 @@ impl mfxFrameIdStruct1 {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct mfxFrameIdStruct2 {
     pub ViewId: mfxU16,
 }
@@ -109,6 +112,7 @@ impl mfxFrameIdStruct2 {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub union mfxFrameIdUnion {
     pub s1: mfxFrameIdStruct1,
     pub s2: mfxFrameIdStruct2,
@@ -123,6 +127,7 @@ impl mfxFrameIdUnion {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct mfxFrameId {
     pub TemporalId: mfxU16,
     pub PriorityId: mfxU16,
@@ -140,6 +145,7 @@ impl mfxFrameId {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct mfxFrameInfo {
     pub reserved: [mfxU32; 4],
     pub reserved4: mfxU16,
@@ -462,6 +468,40 @@ impl mfxFrameSurface1 {
     }
 }
 
+#[repr(C)]
+pub struct mfxBitstream {
+    // TODO: union encrypted data
+    pub reserved: [mfxU32; 6],
+    DecodeTimeStamp: mfxI64,
+    TimeStamp: mfxU64,
+    Data: *const mfxU8,
+    DataOffset: mfxU32,
+    DataLength: mfxU32,
+    MaxLength: mfxU32,
+    PicStruct: mfxU16,
+    FrameType: mfxU16,
+    DataFlag: mfxU16,
+    reserved2: mfxU16,
+}
+
+impl mfxBitstream {
+    pub fn new() -> Self {
+        mfxBitstream {
+            reserved: [0; 6],
+            DecodeTimeStamp: 0,
+            TimeStamp: 0,
+            Data: ptr::null(),
+            DataOffset: 0,
+            DataLength: 0,
+            MaxLength: 0,
+            PicStruct: 0,
+            FrameType: 0,
+            DataFlag: 0,
+            reserved2: 0,
+        }
+    }
+}
+
 #[link(name = "libmfx_vs2015", kind = "static")]
 extern "C" {
     pub fn MFXInit(
@@ -482,6 +522,13 @@ extern "C" {
         session: *const mfxSession,
         par: *const mfxVideoParam,
         request: *mut mfxFrameAllocRequest,
+    ) -> mfxStatus;
+
+    pub fn MFXVideoENCODE_Init(session: *const mfxSession, par: *const mfxVideoParam) -> mfxStatus;
+
+    pub fn MFXVideoENCODE_GetVideoParam(
+        session: *const mfxSession,
+        par: *mut mfxVideoParam,
     ) -> mfxStatus;
 }
 
@@ -553,20 +600,51 @@ fn main() -> io::Result<()> {
         unsafe { MFXVideoENCODE_QueryIOSurf(session, &mfxEncParams, &mut encRequest) };
     println!("Checking surfaces: {}", qurySurfaces);
 
-    let encSurfNum = encRequest.NumFrameSuggested;
-    let width = align32(encRequest.Info.Width as u32);
-    let height = align32(encRequest.Info.Height as u32);
+    let encSurfNum: usize = encRequest.NumFrameSuggested as usize;
+    let width: usize = align32(encRequest.Info.Width as u32) as usize;
+    let height: usize = align32(encRequest.Info.Height as u32) as usize;
     let bitsPerPixel = 12;
-    let surfaceSize = width * height * bitsPerPixel / 8;
+    let surfaceSize = (width) * (height) * bitsPerPixel / 8;
 
     println!("Surfaces: {}, size: {}", encSurfNum, surfaceSize);
+
+    let mut surfaceBuffers: Vec<u8> = Vec::with_capacity(encSurfNum * surfaceSize);
+    surfaceBuffers.resize(encSurfNum * surfaceSize, 0);
+
+    let mut pEncSurfaces: Vec<mfxFrameSurface1> = Vec::new();
+    for i in 0..encSurfNum {
+        let mut surface = mfxFrameSurface1::new();
+        surface.Info = unsafe { mfxEncParams.u.mfx.FrameInfo.clone() };
+        surface.Data.Y = unsafe { surfaceBuffers.as_ptr().offset((surfaceSize * i) as isize) };
+        surface.Data.U = unsafe { surface.Data.Y.offset((width * height) as isize) };
+        surface.Data.U = unsafe { surface.Data.U.offset(1) };
+        surface.Data.PitchLow = width as u16;
+        println!(
+            "Surface {}, size: {} x {}",
+            i, surface.Info.Width, surface.Info.Height
+        );
+        pEncSurfaces.push(surface);
+    }
+
+    let initEnc = unsafe { MFXVideoENCODE_Init(session, &mfxEncParams) };
+    println!("Initializing encoder: {}", initEnc);
+
+    let mut par = mfxVideoParam::new();
+    let getParam = unsafe { MFXVideoENCODE_GetVideoParam(session, &mut par) };
+    println!("Getting encoder parameters: {}", getParam);
+    let bufferSizeInKB = unsafe { par.u.mfx.BufferSizeInKB } as u32;
+    println!("Buffer BufferSizeInKB: {}", bufferSizeInKB);
+
+    let mut mfxBS = mfxBitstream::new();
+    mfxBS.MaxLength = 1000 * bufferSizeInKB;
+    let mut encoded: Vec<u8> = Vec::with_capacity(mfxBS.MaxLength as usize);
+    encoded.resize(mfxBS.MaxLength as usize, 0);
+    mfxBS.Data = encoded.as_ptr();
 
     let mut file = File::open(params.input)?;
     let frame_size: usize = params.width * params.height * 3 / 2;
     let mut v: Vec<u8> = Vec::with_capacity(frame_size);
-    unsafe {
-        v.set_len(frame_size);
-    }
+    v.resize(frame_size, 0);
     let mut frame = 0;
     loop {
         let bytes = file.read(&mut v)?;
