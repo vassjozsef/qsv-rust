@@ -8,6 +8,7 @@ use std::io::prelude::*;
 extern crate libc;
 use std::mem;
 use std::ptr;
+use std::slice;
 
 #[derive(Debug)]
 struct Params {
@@ -29,6 +30,7 @@ pub type mfxStatus = mfxI32;
 pub type mfxSession = libc::c_void;
 pub type mfxHDL = *const libc::c_void;
 pub type mfxMemId = mfxHDL;
+pub type mfxSyncPoint = *const libc::c_void;
 
 pub const MFX_IMPL_AUTO: mfxIMPL = 0x0000;
 pub const MFX_IMPL_SOFTWARE: mfxIMPL = 0x0001;
@@ -39,6 +41,8 @@ pub const MFX_ERR_NONE: mfxStatus = 0;
 pub const MFX_ERR_UNKNOWN: mfxStatus = -1;
 pub const MFX_ERR_NULL_PTR: mfxStatus = -2;
 pub const MFX_ERR_UNSUPPORTED: mfxStatus = -3;
+pub const MFX_ERR_NOT_FOUND: mfxStatus = -9;
+pub const MFX_ERR_MORE_DATA: mfxStatus = -10;
 pub const MFX_ERR_INVALID_VIDEO_PARAM: mfxStatus = -15;
 
 pub const MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: mfxStatus = 5;
@@ -416,12 +420,12 @@ pub struct mfxFrameData {
     // TODO: union Pitch
     PitchLow: mfxU16,
 
-    Y: *const mfxU8,
+    Y: *mut mfxU8,
     // union
-    U: *const mfxU8,
+    UV: *mut mfxU8,
     // union
-    V: *const mfxU8,
-    A: *const mfxU8,
+    V: *mut mfxU8,
+    A: *mut mfxU8,
     MemId: mfxMemId,
     Corrupted: mfxU16,
     DataFlag: mfxU16,
@@ -440,10 +444,10 @@ impl mfxFrameData {
             Locked: 0,
             PitchLow: 0,
 
-            Y: ptr::null(),
-            U: ptr::null(),
-            V: ptr::null(),
-            A: ptr::null(),
+            Y: ptr::null_mut(),
+            UV: ptr::null_mut(),
+            V: ptr::null_mut(),
+            A: ptr::null_mut(),
             MemId: ptr::null(),
             Corrupted: 0,
             DataFlag: 0,
@@ -540,19 +544,87 @@ fn align32(x: u32) -> u32 {
     (x + 31) & !31
 }
 
+fn GetFreeSurfaceIndex(surfaces: &Vec<mfxFrameSurface1>) -> i32 {
+    for i in 0..surfaces.len() {
+        if surfaces[i].Data.Locked == 0 {
+            return i as i32;
+        }
+    }
+
+    return MFX_ERR_NOT_FOUND;
+}
+
+fn ReadPlaneData(
+    w: usize,
+    h: usize,
+    ptr: *mut mfxU8,
+    pitch: usize,
+    offset: usize,
+    file: &mut File,
+) -> Result<mfxStatus, mfxStatus> {
+    let mut buf: Vec<u8> = Vec::with_capacity(w);
+    buf.resize(w, 0);
+    for i in 0..h {
+        let rc = file.read(&mut buf);
+        if rc.is_err() {
+            return Err(MFX_ERR_MORE_DATA);
+        }
+        if rc.unwrap() != (w as usize) {
+            return Err(MFX_ERR_MORE_DATA);
+        }
+
+        for j in 0..w {
+            unsafe { *(ptr.offset((i * pitch + j * 2 + offset) as isize)) = buf[j] };
+        }
+    }
+
+    return Ok(MFX_ERR_NONE);
+}
+
+fn LoadRawFrame(surface: &mut mfxFrameSurface1, file: &mut File) -> Result<mfxStatus, mfxStatus> {
+    let pInfo = &surface.Info;
+    let pData = &surface.Data;
+    let w = pInfo.CropW as usize;
+    let h = pInfo.CropH as usize;
+    let x = pInfo.CropX as usize;
+    let y = pInfo.CropY as usize;
+    let pitch = pData.PitchLow as usize;
+
+    // read luminance plane
+    let ptr = unsafe { pData.Y.offset((x + y * pitch) as isize) };
+    for i in 0..h {
+        let slice = unsafe { slice::from_raw_parts_mut(ptr, w as usize) };
+        let y_result = file.read(slice);
+        if y_result.is_err() {
+            return Err(MFX_ERR_MORE_DATA);
+        }
+    }
+
+    let w_uv = w / 2;
+    let h_uv = h / 2;
+
+    let ptr_uv = unsafe { pData.UV.offset((x + y * pitch / 2) as isize) };
+
+    // load U
+    ReadPlaneData(w_uv, h_uv, ptr_uv, pitch, 0, file)?;
+    // load V
+    ReadPlaneData(w_uv, h_uv, ptr_uv, pitch, 1, file)?;
+
+    return Ok(MFX_ERR_NONE);
+}
+
 fn main() -> io::Result<()> {
     println!("Size of mfxFrameInfo: {}", mem::size_of::<mfxFrameInfo>());
     println!("Size of mfxInfoMFX: {}", mem::size_of::<mfxInfoMFX>());
     println!("Size of mfxInfoVPP: {}", mem::size_of::<mfxInfoVPP>());
     println!("Size of mfxVideoParam: {}", mem::size_of::<mfxVideoParam>());
 
+    let mut sts: mfxStatus;
     let implementation = MFX_IMPL_AUTO_ANY;
     let version = mfxVersion::new(1, 0);
     let mut session: *mut mfxSession = ptr::null_mut();
-    match unsafe { MFXInit(implementation, &version, &mut session) } {
-        MFX_ERR_NONE => println!("MFX initialized"),
-        _ => println!("Error in MFX initialization"),
-    };
+    sts = unsafe { MFXInit(implementation, &version, &mut session) };
+    println!("MFX initialized: {}", sts);
 
     let mut actual = MFX_IMPL_AUTO_ANY;
     unsafe { MFXQueryIMPL(session, &mut actual) };
@@ -592,13 +664,12 @@ fn main() -> io::Result<()> {
     }
     mfxEncParams.IOPattern = MFX_IOPATTERN_IN_SYSTEM_MEMORY;
 
-    let queryParams = unsafe { MFXVideoENCODE_Query(session, &mfxEncParams, &mut mfxEncParams) };
-    println!("Checking encoding parameters: {}", queryParams);
+    sts = unsafe { MFXVideoENCODE_Query(session, &mfxEncParams, &mut mfxEncParams) };
+    println!("Checking encoding parameters: {}", sts);
 
     let mut encRequest = mfxFrameAllocRequest::new();
-    let qurySurfaces =
-        unsafe { MFXVideoENCODE_QueryIOSurf(session, &mfxEncParams, &mut encRequest) };
-    println!("Checking surfaces: {}", qurySurfaces);
+    sts = unsafe { MFXVideoENCODE_QueryIOSurf(session, &mfxEncParams, &mut encRequest) };
+    println!("Checking surfaces: {}", sts);
 
     let encSurfNum: usize = encRequest.NumFrameSuggested as usize;
     let width: usize = align32(encRequest.Info.Width as u32) as usize;
@@ -615,9 +686,13 @@ fn main() -> io::Result<()> {
     for i in 0..encSurfNum {
         let mut surface = mfxFrameSurface1::new();
         surface.Info = unsafe { mfxEncParams.u.mfx.FrameInfo.clone() };
-        surface.Data.Y = unsafe { surfaceBuffers.as_ptr().offset((surfaceSize * i) as isize) };
-        surface.Data.U = unsafe { surface.Data.Y.offset((width * height) as isize) };
-        surface.Data.U = unsafe { surface.Data.U.offset(1) };
+        surface.Data.Y = unsafe {
+            surfaceBuffers
+                .as_mut_ptr()
+                .offset((surfaceSize * i) as isize)
+        };
+        surface.Data.UV = unsafe { surface.Data.Y.offset((width * height) as isize) };
+        surface.Data.V = unsafe { surface.Data.UV.offset(1) };
         surface.Data.PitchLow = width as u16;
         println!(
             "Surface {}, size: {} x {}",
@@ -626,8 +701,8 @@ fn main() -> io::Result<()> {
         pEncSurfaces.push(surface);
     }
 
-    let initEnc = unsafe { MFXVideoENCODE_Init(session, &mfxEncParams) };
-    println!("Initializing encoder: {}", initEnc);
+    sts = unsafe { MFXVideoENCODE_Init(session, &mfxEncParams) };
+    println!("Initializing encoder: {}", sts);
 
     let mut par = mfxVideoParam::new();
     let getParam = unsafe { MFXVideoENCODE_GetVideoParam(session, &mut par) };
@@ -641,18 +716,22 @@ fn main() -> io::Result<()> {
     encoded.resize(mfxBS.MaxLength as usize, 0);
     mfxBS.Data = encoded.as_ptr();
 
+    let mut nEncSurfIdx = 0;
+    let syncp: mfxSyncPoint = ptr::null();
+    let mut nFrame: mfxU32 = 0;
+
     let mut file = File::open(params.input)?;
     let frame_size: usize = params.width * params.height * 3 / 2;
-    let mut v: Vec<u8> = Vec::with_capacity(frame_size);
-    v.resize(frame_size, 0);
-    let mut frame = 0;
-    loop {
-        let bytes = file.read(&mut v)?;
-        if bytes == 0 {
+
+    while MFX_ERR_NONE <= sts || MFX_ERR_MORE_DATA == sts {
+        nEncSurfIdx = GetFreeSurfaceIndex(&pEncSurfaces);
+        let read_status = LoadRawFrame(&mut pEncSurfaces[nEncSurfIdx as usize], &mut file);
+        if read_status.is_err() {
             break;
         }
-        frame += 1;
-        println!("Read frame {} of {} bytes", frame, bytes);
+
+        nFrame += 1;
+        println!("Processed frame {}", nFrame);
     }
     Ok(())
 }
