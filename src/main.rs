@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 extern crate libc;
+use std::io::{Error, ErrorKind};
 use std::mem;
 use std::ptr;
 use std::slice;
@@ -41,9 +42,11 @@ pub const MFX_ERR_NONE: mfxStatus = 0;
 pub const MFX_ERR_UNKNOWN: mfxStatus = -1;
 pub const MFX_ERR_NULL_PTR: mfxStatus = -2;
 pub const MFX_ERR_UNSUPPORTED: mfxStatus = -3;
+pub const MFX_ERR_NOT_ENOUGH_BUFFER: mfxStatus = -5;
 pub const MFX_ERR_NOT_FOUND: mfxStatus = -9;
 pub const MFX_ERR_MORE_DATA: mfxStatus = -10;
 pub const MFX_ERR_INVALID_VIDEO_PARAM: mfxStatus = -15;
+pub const MFX_ERR_UNDEFINED_BEHAVIOR: mfxStatus = -16;
 
 pub const MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: mfxStatus = 5;
 
@@ -322,8 +325,8 @@ impl mfxExtBuffer {
 #[repr(C)]
 pub struct mfxInfoVPP {
     pub reserved: [mfxU32; 8],
-    In: mfxFrameInfo,
-    Out: mfxFrameInfo,
+    pub In: mfxFrameInfo,
+    pub Out: mfxFrameInfo,
 }
 
 impl mfxInfoVPP {
@@ -410,25 +413,25 @@ impl mfxFrameAllocRequest {
 pub struct mfxFrameData {
     // TODO: union ExtParam: const* const* mfxExtBuffer
     pub reserved2: mfxU64,
-    NumExtParam: mfxU16,
-    reserved: [mfxU16; 9],
-    MemType: mfxU16,
-    PitchHigh: mfxU16,
-    TimeStamp: mfxU64,
-    FrameOrder: mfxU32,
-    Locked: mfxU16,
+    pub NumExtParam: mfxU16,
+    pub reserved: [mfxU16; 9],
+    pub MemType: mfxU16,
+    pub PitchHigh: mfxU16,
+    pub TimeStamp: mfxU64,
+    pub FrameOrder: mfxU32,
+    pub Locked: mfxU16,
     // TODO: union Pitch
-    PitchLow: mfxU16,
+    pub PitchLow: mfxU16,
 
-    Y: *mut mfxU8,
+    pub Y: *mut mfxU8,
     // union
-    UV: *mut mfxU8,
+    pub UV: *mut mfxU8,
     // union
-    V: *mut mfxU8,
-    A: *mut mfxU8,
-    MemId: mfxMemId,
-    Corrupted: mfxU16,
-    DataFlag: mfxU16,
+    pub V: *mut mfxU8,
+    pub A: *mut mfxU8,
+    pub MemId: mfxMemId,
+    pub Corrupted: mfxU16,
+    pub DataFlag: mfxU16,
 }
 
 impl mfxFrameData {
@@ -476,16 +479,16 @@ impl mfxFrameSurface1 {
 pub struct mfxBitstream {
     // TODO: union encrypted data
     pub reserved: [mfxU32; 6],
-    DecodeTimeStamp: mfxI64,
-    TimeStamp: mfxU64,
-    Data: *const mfxU8,
-    DataOffset: mfxU32,
-    DataLength: mfxU32,
-    MaxLength: mfxU32,
-    PicStruct: mfxU16,
-    FrameType: mfxU16,
-    DataFlag: mfxU16,
-    reserved2: mfxU16,
+    pub DecodeTimeStamp: mfxI64,
+    pub TimeStamp: mfxU64,
+    pub Data: *const mfxU8,
+    pub DataOffset: mfxU32,
+    pub DataLength: mfxU32,
+    pub MaxLength: mfxU32,
+    pub PicStruct: mfxU16,
+    pub FrameType: mfxU16,
+    pub DataFlag: mfxU16,
+    pub reserved2: mfxU16,
 }
 
 impl mfxBitstream {
@@ -504,6 +507,31 @@ impl mfxBitstream {
             reserved2: 0,
         }
     }
+}
+
+#[repr(C)]
+pub struct mfxEncodeCtrl {
+    pub Header: mfxExtBuffer,
+    pub reserved: [mfxU32; 5],
+    pub SkipFrame: mfxU16,
+
+    pub QP: mfxU16,
+    pub FrameType: mfxU16,
+    pub NumExtParam: mfxU16,
+    pub NumPayload: mfxU16,
+    pub reserved2: mfxU16,
+
+    pub ExtParam: *const *const mfxExtBuffer,
+    pub Payload: *const *const mfxPayload,
+}
+
+#[repr(C)]
+pub struct mfxPayload {
+    pub reserved: [mfxU32; 4],
+    pub Data: *const mfxU8,
+    pub NumBit: mfxU32,
+    pub Type: mfxU16,
+    pub BufSize: mfxU16,
 }
 
 #[link(name = "libmfx_vs2015", kind = "static")]
@@ -534,6 +562,22 @@ extern "C" {
         session: *const mfxSession,
         par: *mut mfxVideoParam,
     ) -> mfxStatus;
+
+    pub fn MFXVideoENCODE_EncodeFrameAsync(
+        session: *const mfxSession,
+        ctrl: *const mfxEncodeCtrl,
+        surface: *const mfxFrameSurface1,
+        bs: *mut mfxBitstream,
+        syncp: *mut mfxSyncPoint,
+    ) -> mfxStatus;
+
+    pub fn MFXVideoCORE_SyncOperation(
+        session: *const mfxSession,
+        syncp: mfxSyncPoint,
+        wait: mfxU32,
+    ) -> mfxStatus;
+
+    pub fn MFXVideoENCODE_Close(session: *const mfxSession) -> mfxStatus;
 }
 
 fn align16(x: u16) -> u16 {
@@ -544,14 +588,14 @@ fn align32(x: u32) -> u32 {
     (x + 31) & !31
 }
 
-fn GetFreeSurfaceIndex(surfaces: &Vec<mfxFrameSurface1>) -> i32 {
+fn GetFreeSurfaceIndex(surfaces: &Vec<mfxFrameSurface1>) -> Result<usize, mfxStatus> {
     for i in 0..surfaces.len() {
         if surfaces[i].Data.Locked == 0 {
-            return i as i32;
+            return Ok(i);
         }
     }
 
-    return MFX_ERR_NOT_FOUND;
+    return Err(MFX_ERR_NOT_FOUND);
 }
 
 fn ReadPlaneData(
@@ -593,7 +637,7 @@ fn LoadRawFrame(surface: &mut mfxFrameSurface1, file: &mut File) -> Result<mfxSt
     // read luminance plane
     let ptr = unsafe { pData.Y.offset((x + y * pitch) as isize) };
     for i in 0..h {
-        let slice = unsafe { slice::from_raw_parts_mut(ptr, w as usize) };
+        let slice = unsafe { slice::from_raw_parts_mut(ptr.offset((i * pitch) as isize), w) };
         let y_result = file.read(slice);
         if y_result.is_err() {
             return Err(MFX_ERR_MORE_DATA);
@@ -611,6 +655,21 @@ fn LoadRawFrame(surface: &mut mfxFrameSurface1, file: &mut File) -> Result<mfxSt
     ReadPlaneData(w_uv, h_uv, ptr_uv, pitch, 1, file)?;
 
     return Ok(MFX_ERR_NONE);
+}
+
+fn WriteBitStreamFrame(pMfxBitstream: &mut mfxBitstream, file: &mut File) -> io::Result<()> {
+    let buffer = unsafe {
+        slice::from_raw_parts(
+            pMfxBitstream.Data.offset(pMfxBitstream.DataOffset as isize),
+            pMfxBitstream.DataLength as usize,
+        )
+    };
+    let nBytesWritten = file.write(buffer)?;
+    if nBytesWritten != (pMfxBitstream.DataLength as usize) {
+        return Err(Error::from(ErrorKind::InvalidData));
+    }
+    pMfxBitstream.DataLength = 0;
+    return Ok(());
 }
 
 fn main() -> io::Result<()> {
@@ -633,7 +692,7 @@ fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 6 {
         println!("Usage: {} input output width height bitrate", args[0]);
-        std::process::exit(-1);
+        return Err(Error::from(ErrorKind::InvalidInput));
     }
     let params = Params {
         input: args[1].clone(),
@@ -716,22 +775,99 @@ fn main() -> io::Result<()> {
     encoded.resize(mfxBS.MaxLength as usize, 0);
     mfxBS.Data = encoded.as_ptr();
 
-    let mut nEncSurfIdx = 0;
-    let syncp: mfxSyncPoint = ptr::null();
+    let mut syncp: mfxSyncPoint = ptr::null_mut();
     let mut nFrame: mfxU32 = 0;
 
-    let mut file = File::open(params.input)?;
-    let frame_size: usize = params.width * params.height * 3 / 2;
+    let mut file_in = File::open(params.input)?;
+    let mut file_out = File::create(params.output)?;
 
+    // Stage 1: Main encoding loop
     while MFX_ERR_NONE <= sts || MFX_ERR_MORE_DATA == sts {
-        nEncSurfIdx = GetFreeSurfaceIndex(&pEncSurfaces);
-        let read_status = LoadRawFrame(&mut pEncSurfaces[nEncSurfIdx as usize], &mut file);
+        let get_surface_status = GetFreeSurfaceIndex(&pEncSurfaces);
+        if get_surface_status.is_err() {
+            println!("Memory allocation error");
+            return Err(Error::new(ErrorKind::Other, "Memory allocation error"));
+        }
+        let nEncSurfIdx = get_surface_status.unwrap();
+        let read_status = LoadRawFrame(&mut pEncSurfaces[nEncSurfIdx], &mut file_in);
         if read_status.is_err() {
+            sts = read_status.unwrap_err();
             break;
         }
 
-        nFrame += 1;
-        println!("Processed frame {}", nFrame);
+        sts = unsafe {
+            MFXVideoENCODE_EncodeFrameAsync(
+                session,
+                ptr::null(),
+                &pEncSurfaces[nEncSurfIdx],
+                &mut mfxBS,
+                &mut syncp,
+            )
+        };
+
+        println!("Encode result: {}, sync: {:#?}", sts, syncp);
+
+        if MFX_ERR_NONE < sts {
+            println!("Encode warning: {}", sts);
+        }
+        if MFX_ERR_NOT_ENOUGH_BUFFER == sts {
+            println!("Not enough buffers");
+        }
+        if MFX_ERR_NONE == sts {
+            sts = unsafe { MFXVideoCORE_SyncOperation(session, syncp, 6000) };
+            println!("Sync resut: {}", sts);
+            nFrame += 1;
+            println!("Processed frame {}", nFrame);
+
+            WriteBitStreamFrame(&mut mfxBS, &mut file_out)?;
+        }
     }
+
+    // MFX_ERR_MORE_DATA means that the input file has ended, need to go to buffering loop, exit in case of other errors
+    if sts == MFX_ERR_MORE_DATA {
+        sts = MFX_ERR_NONE;
+    } else {
+        return Err(Error::new(ErrorKind::Other, "Encode error"));
+    }
+
+    // Stage 2: Retrieve the buffered encoded frames
+    while MFX_ERR_NONE <= sts {
+        sts = unsafe {
+            MFXVideoENCODE_EncodeFrameAsync(
+                session,
+                ptr::null(),
+                ptr::null(),
+                &mut mfxBS,
+                &mut syncp,
+            )
+        };
+
+        println!("Encode flush result: {}, sync: {:#?}", sts, syncp);
+
+        if MFX_ERR_NONE < sts {
+            println!("Encode flush warning: {}", sts);
+        }
+
+        if MFX_ERR_NONE == sts {
+            sts = unsafe { MFXVideoCORE_SyncOperation(session, syncp, 6000) };
+            println!("Sync flush resut: {}", sts);
+            nFrame += 1;
+            println!("Processed flush frame {}", nFrame);
+
+            WriteBitStreamFrame(&mut mfxBS, &mut file_out)?;
+        }
+    }
+
+    // MFX_ERR_MORE_DATA indicates that there are no more buffered frames, exit in case of other errors
+    if sts == MFX_ERR_MORE_DATA {
+        sts = MFX_ERR_NONE;
+    }
+
+    if sts != MFX_ERR_NONE {
+        return Err(Error::new(ErrorKind::Other, "Encode error"));
+    }
+
+    unsafe { MFXVideoENCODE_Close(session) };
+
     Ok(())
 }

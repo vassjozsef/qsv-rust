@@ -1,7 +1,7 @@
 Quick Sync Rust Encoder
 =======================
 
-Quick Sync video encoder in Rust.
+Quick Sync video encoder in Rust. Based on [https://software.intel.com/en-us/articles/media-sdk-tutorials-for-client-and-server](https://software.intel.com/en-us/articles/media-sdk-tutorials-for-client-and-server) `simple_3_encode`.
 
 Setup
 -----
@@ -15,3 +15,7 @@ Active toolchain:
 Build:
 
     cargo build
+
+Run:
+
+     cargo run input.yuv out.h264 1920 1080 6000
