@@ -37,6 +37,7 @@ pub const MFX_IMPL_AUTO: mfxIMPL = 0x0000;
 pub const MFX_IMPL_SOFTWARE: mfxIMPL = 0x0001;
 pub const MFX_IMPL_HARDWARE: mfxIMPL = 0x0002;
 pub const MFX_IMPL_AUTO_ANY: mfxIMPL = 0x0003;
+pub const MFX_IMPL_HARDWARE_ANY: mfxIMPL = 0x0004;
 
 pub const MFX_ERR_NONE: mfxStatus = 0;
 pub const MFX_ERR_UNKNOWN: mfxStatus = -1;
@@ -65,6 +66,7 @@ pub const MFX_TARGETUSAGE_BEST_SPEED: u16 = MFX_TARGETUSAGE_7;
 
 pub const MFX_CODEC_AVC: mfxU32 = 0x20435641;
 pub const MFX_FOURCC_NV12: mfxU32 = 0x3231564e;
+pub const MFX_FOURCC_YV12: mfxU32 = 0x32315659;
 
 pub const MFX_RATECONTROL_CBR: u16 = 1;
 pub const MFX_RATECONTROL_VBR: u16 = 2;
@@ -75,8 +77,10 @@ pub const MFX_CHROMAFORMAT_YUV420: u16 = 1;
 pub const MFX_PICSTRUCT_UNKNOWN: u16 = 0;
 pub const MFX_PICSTRUCT_PROGRESSIVE: u16 = 1;
 
-pub const MFX_IOPATTERN_IN_VIDEO_MEMORY: u16 = 1;
-pub const MFX_IOPATTERN_IN_SYSTEM_MEMORY: u16 = 2;
+pub const MFX_IOPATTERN_IN_VIDEO_MEMORY: u16 = 0x01;
+pub const MFX_IOPATTERN_IN_SYSTEM_MEMORY: u16 = 0x02;
+pub const MFX_IOPATTERN_OUT_VIDEO_MEMORY: u16 = 0x10;
+pub const MFX_IOPATTERN_OUT_SYSTEM_MEMORY: u16 = 0x20;
 
 #[repr(C)]
 pub struct mfxVersion {
@@ -534,8 +538,20 @@ pub struct mfxPayload {
     pub BufSize: mfxU16,
 }
 
+#[repr(C)]
+pub struct mfxExtVppAuxData {
+    Header: mfxExtBuffer,
+
+    // TODO: union
+    SpatialComplexity: mfxU32,
+    TemporalComplexity: mfxU32,
+
+    SceneChangeRate: mfxU16,
+    RepeatedFrame: mfxU16,
+}
+
 #[link(name = "libmfx_vs2015", kind = "static")]
-extern "C" {
+extern "stdcall" {
     pub fn MFXInit(
         implementation: mfxIMPL,
         ver: *const mfxVersion,
@@ -578,6 +594,25 @@ extern "C" {
     ) -> mfxStatus;
 
     pub fn MFXVideoENCODE_Close(session: *const mfxSession) -> mfxStatus;
+
+    // VPP
+    pub fn MFXVideoVPP_QueryIOSurf(
+        session: *const mfxSession,
+        par: *const mfxVideoParam,
+        request: &mut [mfxFrameAllocRequest; 2],
+    ) -> mfxStatus;
+
+    pub fn MFXVideoVPP_Init(session: *const mfxSession, par: *mut mfxVideoParam) -> mfxStatus;
+
+    pub fn MFXVideoVPP_RunFrameVPPAsync(
+        session: *const mfxSession,
+        input: *const mfxFrameSurface1,
+        output: *mut mfxFrameSurface1,
+        aux: *const mfxExtVppAuxData,
+        syncp: *mut mfxSyncPoint,
+    ) -> mfxStatus;
+
+    pub fn MFXVideoVPP_Close(session: *const mfxSession) -> mfxStatus;
 }
 
 fn align16(x: u16) -> u16 {
@@ -679,13 +714,13 @@ fn main() -> io::Result<()> {
     println!("Size of mfxVideoParam: {}", mem::size_of::<mfxVideoParam>());
 
     let mut sts: mfxStatus;
-    let implementation = MFX_IMPL_AUTO_ANY;
+    let implementation = MFX_IMPL_HARDWARE_ANY;
     let version = mfxVersion::new(1, 0);
     let mut session: *mut mfxSession = ptr::null_mut();
     sts = unsafe { MFXInit(implementation, &version, &mut session) };
     println!("MFX initialized: {}", sts);
 
-    let mut actual = MFX_IMPL_AUTO_ANY;
+    let mut actual = MFX_IMPL_HARDWARE_ANY;
     unsafe { MFXQueryIMPL(session, &mut actual) };
     println!("H264 implementation: 0x{:x}", actual);
 
@@ -703,31 +738,141 @@ fn main() -> io::Result<()> {
     };
     println!("{:?}", params);
 
-    let mut mfxEncParams = mfxVideoParam::new();
+    let mut VppParams = mfxVideoParam::new();
     unsafe {
-        mfxEncParams.u.mfx.CodecId = MFX_CODEC_AVC;
-        mfxEncParams.u.mfx.TargetUsage = MFX_TARGETUSAGE_BALANCED;
-        mfxEncParams.u.mfx.u2.TargetKbps = params.bitrate;
-        mfxEncParams.u.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
-        mfxEncParams.u.mfx.FrameInfo.FrameRateExtN = 30;
-        mfxEncParams.u.mfx.FrameInfo.FrameRateExtD = 1;
-        mfxEncParams.u.mfx.FrameInfo.FourCC = MFX_FOURCC_NV12;
-        mfxEncParams.u.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
-        mfxEncParams.u.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
-        mfxEncParams.u.mfx.FrameInfo.CropX = 0;
-        mfxEncParams.u.mfx.FrameInfo.CropY = 0;
-        mfxEncParams.u.mfx.FrameInfo.CropW = params.width as u16;
-        mfxEncParams.u.mfx.FrameInfo.CropH = params.height as u16;
-        mfxEncParams.u.mfx.FrameInfo.Width = align16(params.width as u16);
-        mfxEncParams.u.mfx.FrameInfo.Height = align16(params.height as u16);
-    }
-    mfxEncParams.IOPattern = MFX_IOPATTERN_IN_SYSTEM_MEMORY;
+        VppParams.u.vpp.In.FourCC = MFX_FOURCC_YV12;
+        VppParams.u.vpp.In.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        VppParams.u.vpp.In.CropX = 0;
+        VppParams.u.vpp.In.CropY = 0;
+        VppParams.u.vpp.In.CropW = params.width as u16;
+        VppParams.u.vpp.In.CropH = params.height as u16;
+        VppParams.u.vpp.In.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
+        VppParams.u.vpp.In.FrameRateExtN = 30;
+        VppParams.u.vpp.In.FrameRateExtD = 1;
+        VppParams.u.vpp.In.Width = align16(params.width as u16);
+        VppParams.u.vpp.In.Height = align16(params.height as u16);
 
-    sts = unsafe { MFXVideoENCODE_Query(session, &mfxEncParams, &mut mfxEncParams) };
+        VppParams.u.vpp.Out.FourCC = MFX_FOURCC_NV12;
+        VppParams.u.vpp.Out.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        VppParams.u.vpp.Out.CropX = 0;
+        VppParams.u.vpp.Out.CropY = 0;
+        VppParams.u.vpp.Out.CropW = params.width as u16;
+        VppParams.u.vpp.Out.CropH = params.height as u16;
+        VppParams.u.vpp.Out.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
+        VppParams.u.vpp.Out.FrameRateExtN = 30;
+        VppParams.u.vpp.Out.FrameRateExtD = 1;
+        VppParams.u.vpp.Out.Width = align16(params.width as u16);
+        VppParams.u.vpp.Out.Height = align16(params.height as u16);
+    }
+    VppParams.IOPattern = MFX_IOPATTERN_IN_SYSTEM_MEMORY | MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
+
+    let mut VPPRequest = [mfxFrameAllocRequest::new(), mfxFrameAllocRequest::new()];
+    sts = unsafe { MFXVideoVPP_QueryIOSurf(session, &VppParams, &mut VPPRequest) };
+    println!("Checking VPP surfaces: {}", sts);
+
+    let nVPPSurfNumIn: usize = VPPRequest[0].NumFrameSuggested as usize;
+    let nVPPSurfNumOut: usize = VPPRequest[1].NumFrameSuggested as usize;
+
+    println!("VPP Surfaces: {}->{}", nVPPSurfNumIn, nVPPSurfNumOut);
+
+    // allocate surfaces for VPP in
+    let width_vpp_in: usize = align32(unsafe { VppParams.u.vpp.In.Width as u32 }) as usize;
+    let height_vpp_in: usize = align32(unsafe { VppParams.u.vpp.In.Height as u32 }) as usize;
+    let bitsPerPixel = 12;
+    let surfaceSizeIn = width_vpp_in * height_vpp_in * bitsPerPixel / 8;
+
+    let mut surfaceBuffersIn: Vec<u8> = Vec::with_capacity(nVPPSurfNumIn * surfaceSizeIn);
+    surfaceBuffersIn.resize(nVPPSurfNumIn * surfaceSizeIn, 0);
+
+    let mut pEncSurfacesIn: Vec<mfxFrameSurface1> = Vec::new();
+    for i in 0..nVPPSurfNumIn {
+        let mut surface = mfxFrameSurface1::new();
+        surface.Info = unsafe { VppParams.u.vpp.In.clone() };
+        surface.Data.Y = unsafe {
+            surfaceBuffersIn
+                .as_mut_ptr()
+                .offset((surfaceSizeIn * i) as isize)
+        };
+        surface.Data.UV = unsafe {
+            surface
+                .Data
+                .Y
+                .offset((width_vpp_in * height_vpp_in) as isize)
+        };
+        surface.Data.V = unsafe {
+            surface
+                .Data
+                .UV
+                .offset((width_vpp_in * height_vpp_in / 4) as isize)
+        };
+        surface.Data.PitchLow = width_vpp_in as u16;
+        println!(
+            "VPP input surface {}, size: {} x {}",
+            i, surface.Info.Width, surface.Info.Height
+        );
+        pEncSurfacesIn.push(surface);
+    }
+
+    // allocate surfaces for VPP out
+    let width_vpp_out: usize = align32(unsafe { VppParams.u.vpp.Out.Width as u32 }) as usize;
+    let height_vpp_out: usize = align32(unsafe { VppParams.u.vpp.Out.Height as u32 }) as usize;
+    let surfaceSizeOut = width_vpp_out * height_vpp_out * bitsPerPixel / 8;
+
+    let mut surfaceBuffersOut: Vec<u8> = Vec::with_capacity(nVPPSurfNumOut * surfaceSizeOut);
+    surfaceBuffersOut.resize(nVPPSurfNumOut * surfaceSizeOut, 0);
+
+    let mut pEncSurfacesOut: Vec<mfxFrameSurface1> = Vec::new();
+    for i in 0..nVPPSurfNumOut {
+        let mut surface = mfxFrameSurface1::new();
+        surface.Info = unsafe { VppParams.u.vpp.Out.clone() };
+        surface.Data.Y = unsafe {
+            surfaceBuffersOut
+                .as_mut_ptr()
+                .offset((surfaceSizeOut * i) as isize)
+        };
+        surface.Data.UV = unsafe {
+            surface
+                .Data
+                .Y
+                .offset((width_vpp_out * height_vpp_out) as isize)
+        };
+        surface.Data.V = unsafe { surface.Data.UV.offset(1) };
+        surface.Data.PitchLow = width_vpp_in as u16;
+        println!(
+            "VPP output surface {}, size: {} x {}",
+            i, surface.Info.Width, surface.Info.Height
+        );
+        pEncSurfacesOut.push(surface);
+    }
+
+    sts = unsafe { MFXVideoVPP_Init(session, &mut VppParams) };
+    println!("VPP init: {}", sts);
+
+    let mut EncParams = mfxVideoParam::new();
+    unsafe {
+        EncParams.u.mfx.CodecId = MFX_CODEC_AVC;
+        EncParams.u.mfx.TargetUsage = MFX_TARGETUSAGE_BALANCED;
+        EncParams.u.mfx.u2.TargetKbps = params.bitrate;
+        EncParams.u.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+        EncParams.u.mfx.FrameInfo.FrameRateExtN = 30;
+        EncParams.u.mfx.FrameInfo.FrameRateExtD = 1;
+        EncParams.u.mfx.FrameInfo.FourCC = MFX_FOURCC_NV12;
+        EncParams.u.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        EncParams.u.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
+        EncParams.u.mfx.FrameInfo.CropX = 0;
+        EncParams.u.mfx.FrameInfo.CropY = 0;
+        EncParams.u.mfx.FrameInfo.CropW = params.width as u16;
+        EncParams.u.mfx.FrameInfo.CropH = params.height as u16;
+        EncParams.u.mfx.FrameInfo.Width = align16(params.width as u16);
+        EncParams.u.mfx.FrameInfo.Height = align16(params.height as u16);
+    }
+    EncParams.IOPattern = MFX_IOPATTERN_IN_SYSTEM_MEMORY;
+
+    sts = unsafe { MFXVideoENCODE_Query(session, &EncParams, &mut EncParams) };
     println!("Checking encoding parameters: {}", sts);
 
     let mut encRequest = mfxFrameAllocRequest::new();
-    sts = unsafe { MFXVideoENCODE_QueryIOSurf(session, &mfxEncParams, &mut encRequest) };
+    sts = unsafe { MFXVideoENCODE_QueryIOSurf(session, &EncParams, &mut encRequest) };
     println!("Checking surfaces: {}", sts);
 
     let encSurfNum: usize = encRequest.NumFrameSuggested as usize;
@@ -744,7 +889,7 @@ fn main() -> io::Result<()> {
     let mut pEncSurfaces: Vec<mfxFrameSurface1> = Vec::new();
     for i in 0..encSurfNum {
         let mut surface = mfxFrameSurface1::new();
-        surface.Info = unsafe { mfxEncParams.u.mfx.FrameInfo.clone() };
+        surface.Info = unsafe { EncParams.u.mfx.FrameInfo.clone() };
         surface.Data.Y = unsafe {
             surfaceBuffers
                 .as_mut_ptr()
@@ -760,7 +905,7 @@ fn main() -> io::Result<()> {
         pEncSurfaces.push(surface);
     }
 
-    sts = unsafe { MFXVideoENCODE_Init(session, &mfxEncParams) };
+    sts = unsafe { MFXVideoENCODE_Init(session, &EncParams) };
     println!("Initializing encoder: {}", sts);
 
     let mut par = mfxVideoParam::new();
