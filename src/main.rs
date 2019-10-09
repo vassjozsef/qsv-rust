@@ -639,8 +639,7 @@ fn LoadRawFrame(surface: &mut mfxFrameSurface1, file: &mut File) -> Result<mfxSt
     let w = pInfo.CropW as usize;
     let h = pInfo.CropH as usize;
 
-    let bits_per_pixel = 12;
-    let size = w * h * bits_per_pixel / 8;
+    let size = w * h;
     let ptr = unsafe { pData.Y.offset(0) };
     let slice = unsafe { slice::from_raw_parts_mut(ptr, size) };
     let result = file.read(slice);
@@ -648,6 +647,27 @@ fn LoadRawFrame(surface: &mut mfxFrameSurface1, file: &mut File) -> Result<mfxSt
         return Err(MFX_ERR_MORE_DATA);
     }
     if result.unwrap() == 0 {
+        return Err(MFX_ERR_MORE_DATA);
+    }
+
+    let size_uv = size / 4;
+    let ptr_u = unsafe { pData.UV.offset(0) };
+    let slice_u = unsafe { slice::from_raw_parts_mut(ptr_u, size_uv) };
+    let result_u = file.read(slice_u);
+    if result_u.is_err() {
+        return Err(MFX_ERR_MORE_DATA);
+    }
+    if result_u.unwrap() != size_uv {
+        return Err(MFX_ERR_MORE_DATA);
+    }
+
+    let ptr_v = unsafe { pData.V.offset(0) };
+    let slice_v = unsafe { slice::from_raw_parts_mut(ptr_v, size_uv) };
+    let result_v = file.read(slice_v);
+    if result_v.is_err() {
+        return Err(MFX_ERR_MORE_DATA);
+    }
+    if result_v.unwrap() != size_uv {
         return Err(MFX_ERR_MORE_DATA);
     }
 
