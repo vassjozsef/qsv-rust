@@ -633,61 +633,56 @@ fn GetFreeSurfaceIndex(surfaces: &Vec<mfxFrameSurface1>) -> Result<usize, mfxSta
     return Err(MFX_ERR_NOT_FOUND);
 }
 
-fn ReadPlaneData(
-    w: usize,
-    h: usize,
-    ptr: *mut mfxU8,
-    pitch: usize,
-    offset: usize,
-    file: &mut File,
-) -> Result<mfxStatus, mfxStatus> {
-    let mut buf: Vec<u8> = Vec::with_capacity(w);
-    buf.resize(w, 0);
-    for i in 0..h {
-        let rc = file.read(&mut buf);
-        if rc.is_err() {
-            return Err(MFX_ERR_MORE_DATA);
-        }
-        if rc.unwrap() != (w as usize) {
-            return Err(MFX_ERR_MORE_DATA);
-        }
-
-        for j in 0..w {
-            unsafe { *(ptr.offset((i * pitch + j * 2 + offset) as isize)) = buf[j] };
-        }
-    }
-
-    return Ok(MFX_ERR_NONE);
-}
-
 fn LoadRawFrame(surface: &mut mfxFrameSurface1, file: &mut File) -> Result<mfxStatus, mfxStatus> {
     let pInfo = &surface.Info;
     let pData = &surface.Data;
     let w = pInfo.CropW as usize;
     let h = pInfo.CropH as usize;
-    let x = pInfo.CropX as usize;
-    let y = pInfo.CropY as usize;
-    let pitch = pData.PitchLow as usize;
 
-    // read luminance plane
-    let ptr = unsafe { pData.Y.offset((x + y * pitch) as isize) };
-    for i in 0..h {
-        let slice = unsafe { slice::from_raw_parts_mut(ptr.offset((i * pitch) as isize), w) };
-        let y_result = file.read(slice);
-        if y_result.is_err() {
-            return Err(MFX_ERR_MORE_DATA);
-        }
+    let bits_per_pixel = 12;
+    let size = w * h * bits_per_pixel / 8;
+    let ptr = unsafe { pData.Y.offset(0) };
+    let slice = unsafe { slice::from_raw_parts_mut(ptr, size) };
+    let result = file.read(slice);
+    if result.is_err() {
+        return Err(MFX_ERR_MORE_DATA);
+    }
+    if result.unwrap() == 0 {
+        return Err(MFX_ERR_MORE_DATA);
     }
 
-    let w_uv = w / 2;
-    let h_uv = h / 2;
+    return Ok(MFX_ERR_NONE);
+}
 
-    let ptr_uv = unsafe { pData.UV.offset((x + y * pitch / 2) as isize) };
+fn VppToEncSurface(
+    src: &mfxFrameSurface1,
+    dst: &mut mfxFrameSurface1,
+) -> Result<mfxStatus, mfxStatus> {
+    let info_src = &src.Info;
+    let data_src = &src.Data;
 
-    // load U
-    ReadPlaneData(w_uv, h_uv, ptr_uv, pitch, 0, file)?;
-    // load V
-    ReadPlaneData(w_uv, h_uv, ptr_uv, pitch, 1, file)?;
+    let w_src = info_src.CropW as usize;
+    let h_src = info_src.CropH as usize;
+
+    let bits_per_pixel = 12;
+    let size_src = w_src * h_src * bits_per_pixel / 8;
+
+    let info_dst = &dst.Info;
+    let data_dst = &dst.Data;
+
+    let w_dst = info_dst.CropW as usize;
+    let h_dst = info_dst.CropH as usize;
+
+    let size_dst = w_dst * h_dst * bits_per_pixel / 8;
+
+    if size_src != size_dst {
+        return Err(MFX_ERR_UNKNOWN);
+    }
+
+    let ptr_src = unsafe { data_src.Y.offset(0) };
+    let ptr_dst = unsafe { data_dst.Y.offset(0) };
+
+    unsafe { ptr::copy(ptr_src, ptr_dst, size_src) };
 
     return Ok(MFX_ERR_NONE);
 }
@@ -781,15 +776,15 @@ fn main() -> io::Result<()> {
     let bitsPerPixel = 12;
     let surfaceSizeIn = width_vpp_in * height_vpp_in * bitsPerPixel / 8;
 
-    let mut surfaceBuffersIn: Vec<u8> = Vec::with_capacity(nVPPSurfNumIn * surfaceSizeIn);
-    surfaceBuffersIn.resize(nVPPSurfNumIn * surfaceSizeIn, 0);
+    let mut surface_buffers_in: Vec<u8> = Vec::with_capacity(nVPPSurfNumIn * surfaceSizeIn);
+    surface_buffers_in.resize(nVPPSurfNumIn * surfaceSizeIn, 0);
 
-    let mut pEncSurfacesIn: Vec<mfxFrameSurface1> = Vec::new();
+    let mut vpp_surfaces_in: Vec<mfxFrameSurface1> = Vec::new();
     for i in 0..nVPPSurfNumIn {
         let mut surface = mfxFrameSurface1::new();
         surface.Info = unsafe { VppParams.u.vpp.In.clone() };
         surface.Data.Y = unsafe {
-            surfaceBuffersIn
+            surface_buffers_in
                 .as_mut_ptr()
                 .offset((surfaceSizeIn * i) as isize)
         };
@@ -810,7 +805,7 @@ fn main() -> io::Result<()> {
             "VPP input surface {}, size: {} x {}",
             i, surface.Info.Width, surface.Info.Height
         );
-        pEncSurfacesIn.push(surface);
+        vpp_surfaces_in.push(surface);
     }
 
     // allocate surfaces for VPP out
@@ -818,15 +813,15 @@ fn main() -> io::Result<()> {
     let height_vpp_out: usize = align32(unsafe { VppParams.u.vpp.Out.Height as u32 }) as usize;
     let surfaceSizeOut = width_vpp_out * height_vpp_out * bitsPerPixel / 8;
 
-    let mut surfaceBuffersOut: Vec<u8> = Vec::with_capacity(nVPPSurfNumOut * surfaceSizeOut);
-    surfaceBuffersOut.resize(nVPPSurfNumOut * surfaceSizeOut, 0);
+    let mut surface_buffers_out: Vec<u8> = Vec::with_capacity(nVPPSurfNumOut * surfaceSizeOut);
+    surface_buffers_out.resize(nVPPSurfNumOut * surfaceSizeOut, 0);
 
-    let mut pEncSurfacesOut: Vec<mfxFrameSurface1> = Vec::new();
+    let mut vpp_surfaces_out: Vec<mfxFrameSurface1> = Vec::new();
     for i in 0..nVPPSurfNumOut {
         let mut surface = mfxFrameSurface1::new();
         surface.Info = unsafe { VppParams.u.vpp.Out.clone() };
         surface.Data.Y = unsafe {
-            surfaceBuffersOut
+            surface_buffers_out
                 .as_mut_ptr()
                 .offset((surfaceSizeOut * i) as isize)
         };
@@ -842,7 +837,7 @@ fn main() -> io::Result<()> {
             "VPP output surface {}, size: {} x {}",
             i, surface.Info.Width, surface.Info.Height
         );
-        pEncSurfacesOut.push(surface);
+        vpp_surfaces_out.push(surface);
     }
 
     sts = unsafe { MFXVideoVPP_Init(session, &mut VppParams) };
@@ -883,15 +878,15 @@ fn main() -> io::Result<()> {
 
     println!("Surfaces: {}, size: {}", encSurfNum, surfaceSize);
 
-    let mut surfaceBuffers: Vec<u8> = Vec::with_capacity(encSurfNum * surfaceSize);
-    surfaceBuffers.resize(encSurfNum * surfaceSize, 0);
+    let mut surface_buffers_enc: Vec<u8> = Vec::with_capacity(encSurfNum * surfaceSize);
+    surface_buffers_enc.resize(encSurfNum * surfaceSize, 0);
 
-    let mut pEncSurfaces: Vec<mfxFrameSurface1> = Vec::new();
+    let mut enc_surfaces: Vec<mfxFrameSurface1> = Vec::new();
     for i in 0..encSurfNum {
         let mut surface = mfxFrameSurface1::new();
         surface.Info = unsafe { EncParams.u.mfx.FrameInfo.clone() };
         surface.Data.Y = unsafe {
-            surfaceBuffers
+            surface_buffers_enc
                 .as_mut_ptr()
                 .offset((surfaceSize * i) as isize)
         };
@@ -899,10 +894,10 @@ fn main() -> io::Result<()> {
         surface.Data.V = unsafe { surface.Data.UV.offset(1) };
         surface.Data.PitchLow = width as u16;
         println!(
-            "Surface {}, size: {} x {}",
+            "Encoder surface {}, size: {} x {}",
             i, surface.Info.Width, surface.Info.Height
         );
-        pEncSurfaces.push(surface);
+        enc_surfaces.push(surface);
     }
 
     sts = unsafe { MFXVideoENCODE_Init(session, &EncParams) };
@@ -920,7 +915,8 @@ fn main() -> io::Result<()> {
     encoded.resize(mfxBS.MaxLength as usize, 0);
     mfxBS.Data = encoded.as_ptr();
 
-    let mut syncp: mfxSyncPoint = ptr::null_mut();
+    let mut syncp_vpp: mfxSyncPoint = ptr::null_mut();
+    let mut syncp_enc: mfxSyncPoint = ptr::null_mut();
     let mut nFrame: mfxU32 = 0;
 
     let mut file_in = File::open(params.input)?;
@@ -928,39 +924,86 @@ fn main() -> io::Result<()> {
 
     // Stage 1: Main encoding loop
     while MFX_ERR_NONE <= sts || MFX_ERR_MORE_DATA == sts {
-        let get_surface_status = GetFreeSurfaceIndex(&pEncSurfaces);
+        let mut get_surface_status = GetFreeSurfaceIndex(&vpp_surfaces_in);
         if get_surface_status.is_err() {
-            println!("Memory allocation error");
+            println!("Error getting VPP in surface");
             return Err(Error::new(ErrorKind::Other, "Memory allocation error"));
         }
-        let nEncSurfIdx = get_surface_status.unwrap();
-        let read_status = LoadRawFrame(&mut pEncSurfaces[nEncSurfIdx], &mut file_in);
+        let nSurfIdxIn = get_surface_status.unwrap();
+
+        let read_status = LoadRawFrame(&mut vpp_surfaces_in[nSurfIdxIn], &mut file_in);
         if read_status.is_err() {
             sts = read_status.unwrap_err();
             break;
+        }
+
+        get_surface_status = GetFreeSurfaceIndex(&vpp_surfaces_out);
+        if get_surface_status.is_err() {
+            println!("Error getting VPP out surface");
+            return Err(Error::new(ErrorKind::Other, "Memory allocation error"));
+        }
+        let nSurfIdxOut = get_surface_status.unwrap();
+
+        sts = unsafe {
+            MFXVideoVPP_RunFrameVPPAsync(
+                session,
+                &vpp_surfaces_in[nSurfIdxIn],
+                &mut vpp_surfaces_out[nSurfIdxOut],
+                ptr::null(),
+                &mut syncp_vpp,
+            )
+        };
+
+        println!(
+            "VPP result for {} -> {}: {}, sync: {:#?}",
+            nSurfIdxIn, nSurfIdxOut, sts, syncp_vpp
+        );
+
+        if sts == MFX_ERR_MORE_DATA {
+            continue;
+        }
+
+        sts = unsafe { MFXVideoCORE_SyncOperation(session, syncp_vpp, 6000) };
+        println!("VPP sync result: {}", sts);
+
+        get_surface_status = GetFreeSurfaceIndex(&enc_surfaces);
+        if get_surface_status.is_err() {
+            println!("Error getting ENC surface");
+            return Err(Error::new(ErrorKind::Other, "Memory allocation error"));
+        }
+        let nEncSurfIdx = get_surface_status.unwrap();
+
+        let copy_status = VppToEncSurface(
+            &vpp_surfaces_out[nSurfIdxOut],
+            &mut enc_surfaces[nEncSurfIdx],
+        );
+
+        if copy_status.is_err() {
+            println!("Error copying VPP to ENC");
+            return Err(Error::new(ErrorKind::Other, "Frame copy error"));
         }
 
         sts = unsafe {
             MFXVideoENCODE_EncodeFrameAsync(
                 session,
                 ptr::null(),
-                &pEncSurfaces[nEncSurfIdx],
+                &enc_surfaces[nEncSurfIdx],
                 &mut mfxBS,
-                &mut syncp,
+                &mut syncp_enc,
             )
         };
 
-        println!("Encode result: {}, sync: {:#?}", sts, syncp);
+        println!("Encode result: {}, sync: {:#?}", sts, syncp_enc);
 
         if MFX_ERR_NONE < sts {
             println!("Encode warning: {}", sts);
         }
         if MFX_ERR_NOT_ENOUGH_BUFFER == sts {
-            println!("Not enough buffers");
+            println!("Encode not enough buffers");
         }
         if MFX_ERR_NONE == sts {
-            sts = unsafe { MFXVideoCORE_SyncOperation(session, syncp, 6000) };
-            println!("Sync resut: {}", sts);
+            sts = unsafe { MFXVideoCORE_SyncOperation(session, syncp_enc, 6000) };
+            println!("Encode sync resut: {}", sts);
             nFrame += 1;
             println!("Processed frame {}", nFrame);
 
@@ -968,47 +1011,8 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // MFX_ERR_MORE_DATA means that the input file has ended, need to go to buffering loop, exit in case of other errors
-    if sts == MFX_ERR_MORE_DATA {
-        sts = MFX_ERR_NONE;
-    } else {
-        return Err(Error::new(ErrorKind::Other, "Encode error"));
-    }
-
-    // Stage 2: Retrieve the buffered encoded frames
-    while MFX_ERR_NONE <= sts {
-        sts = unsafe {
-            MFXVideoENCODE_EncodeFrameAsync(
-                session,
-                ptr::null(),
-                ptr::null(),
-                &mut mfxBS,
-                &mut syncp,
-            )
-        };
-
-        println!("Encode flush result: {}, sync: {:#?}", sts, syncp);
-
-        if MFX_ERR_NONE < sts {
-            println!("Encode flush warning: {}", sts);
-        }
-
-        if MFX_ERR_NONE == sts {
-            sts = unsafe { MFXVideoCORE_SyncOperation(session, syncp, 6000) };
-            println!("Sync flush resut: {}", sts);
-            nFrame += 1;
-            println!("Processed flush frame {}", nFrame);
-
-            WriteBitStreamFrame(&mut mfxBS, &mut file_out)?;
-        }
-    }
-
-    // MFX_ERR_MORE_DATA indicates that there are no more buffered frames, exit in case of other errors
-    if sts == MFX_ERR_MORE_DATA {
-        sts = MFX_ERR_NONE;
-    }
-
-    if sts != MFX_ERR_NONE {
+    // MFX_ERR_MORE_DATA means that the input file has ended, we do not care flushing encode buffers
+    if sts != MFX_ERR_MORE_DATA {
         return Err(Error::new(ErrorKind::Other, "Encode error"));
     }
 
